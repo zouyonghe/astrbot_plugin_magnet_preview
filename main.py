@@ -3,6 +3,7 @@ import math
 import base64
 from typing import Any, AsyncGenerator, Dict, List, Tuple
 import aiohttp
+import asyncio
 
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, filter, MessageChain
@@ -12,7 +13,6 @@ from astrbot.api.message_components import Plain, Node, Nodes
 
 DEFAULT_WHATSLINK_URL = "https://whatslink.info" 
 DEFAULT_TIMEOUT = 10
-FORWARD_THRESHOLD = 500
 
 FILE_TYPE_MAP = {
     'folder': '📁 文件夹',
