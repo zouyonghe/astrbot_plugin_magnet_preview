@@ -12,7 +12,7 @@ import astrbot.api.message_components as Comp
 from astrbot.api.message_components import Plain, Node, Nodes
 
 DEFAULT_WHATSLINK_URL = "https://whatslink.info" 
-DEFAULT_TIMEOUT = 10
+DEFAULT_TIMEOUT = 10 
 
 FILE_TYPE_MAP = {
     'folder': '📁 文件夹',
@@ -42,29 +42,32 @@ class MagnetPreviewer(Star):
         self.api_url = f"{self.whatslink_url}/api/v1/link"
 
         self._magnet_regex = re.compile(r"(magnet:\?xt=urn:btih:[\w\d]{40}.*)")
-        self._command_regex = re.compile(r"text='(.*?)'") 
+        self._command_regex = re.compile(r"text='(.*?)'")
+        self._hash_regex = re.compile(r"([a-fA-F0-9]{40})")
         
     async def terminate(self):
         logger.info("Magnet Previewer terminating")
         await super().terminate()
 
     @filter.event_message_type(filter.EventMessageType.ALL)
-    @filter.regex(r"magnet:\?xt=urn:btih:[\w\d]{40}.*")
+    @filter.regex(r"(magnet:\?xt=urn:btih:[\w\d]{40}.*)|([a-fA-F0-9]{40})")
     async def handle_magnet(self, event: AstrMessageEvent) -> AsyncGenerator[Any, Any]:
         """处理磁力链接请求，根据配置决定输出方式"""
         
-        # 1. 提取磁力链接
         plain_text = str(event.get_messages()[0])
         link = ""
-        try:
-            matches = self._command_regex.findall(plain_text)
-            command = matches[0]
-            link = command.split("&")[0]
-        except (IndexError, AttributeError):
-            matches = self._magnet_regex.search(plain_text)
-            if matches:
-                link = matches.group(1).split('&')[0]
         
+        # 1. 提取磁力链接
+        matches_magnet = self._magnet_regex.search(plain_text)
+        if matches_magnet:
+            link = matches_magnet.group(1).split('&')[0]
+            
+        # 如果没有找到完整的链接，则寻找裸哈希
+        if not link:
+            matches_hash = self._hash_regex.search(plain_text)
+            if matches_hash:
+                info_hash = matches_hash.group(1).upper() # 提取哈希并转大写
+                link = f"magnet:?xt=urn:btih:{info_hash}"
         if not link:
             yield event.plain_result("⚠️ 格式错误，未找到有效的磁力链接。")
             return
@@ -118,7 +121,6 @@ class MagnetPreviewer(Star):
         async with aiohttp.ClientSession() as session:
             for url in screenshots_urls:
                 try:
-                    # 下载并编码图片
                     timeout = aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT)
                     async with session.get(url, timeout=timeout) as img_response:
                         img_response.raise_for_status()
@@ -127,7 +129,6 @@ class MagnetPreviewer(Star):
                     image_base64 = base64.b64encode(image_bytes).decode()
                     image_component = Comp.Image(file=f"base64://{image_base64}")
                     
-                    # 为每张图片创建一个单独的节点
                     forward_nodes.append(Node(uin=sender_id, name="预览截图", content=[image_component]))
                     download_success += 1
                 except (aiohttp.ClientError, asyncio.TimeoutError, Exception) as e:
@@ -136,12 +137,10 @@ class MagnetPreviewer(Star):
         
         # 3. 检查发送结果
         if download_success == 0 and len(screenshots_urls) > 0:
-            # 图片全部失败，回退到纯文本链接模式
             logger.warning("所有图片下载失败，回退到纯文本链接模式。")
             result_message = self._format_text_result(infos, screenshots_urls)
             yield event.plain_result("⚠️ 图片发送失败，已改为发送链接。\n\n" + result_message)
         else:
-            # 成功构建转发消息
             merged_forward_message = Nodes(nodes=forward_nodes)
             yield event.chain_result([merged_forward_message])
 
@@ -150,7 +149,6 @@ class MagnetPreviewer(Star):
         return [text[i:i + max_length] for i in range(0, len(text), max_length)]
 
     def _sort_infos_and_get_urls(self, info: dict) -> Tuple[List[str], List[str]]:
-        # 整理基础信息
         file_type = str(info.get('file_type', 'unknown')).lower()
         base_info = [
             f"🔍 解析结果：\r",
