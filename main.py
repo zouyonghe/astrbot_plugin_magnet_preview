@@ -1,9 +1,10 @@
 import re
 import math
-import base64
+from io import BytesIO
 from typing import Any, AsyncGenerator, Dict, List, Tuple
 import aiohttp
 import asyncio
+from PIL import Image as PILImage
 
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, filter, MessageChain
@@ -31,7 +32,7 @@ class MagnetPreviewer(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         
-        self.output_as_link = config.get("output_image_as_direct_link", True)
+        self.output_as_link = config.get("output_image_as_direct_link", False)
         try:
             self.max_screenshots = max(0, min(5, int(config.get("max_screenshot_count", 3))))
         except (TypeError, ValueError):
@@ -99,45 +100,40 @@ class MagnetPreviewer(Star):
         """生成并发送包含图片的合并转发消息"""
         
         sender_id = event.get_self_id()
-        download_success = 0
         forward_nodes: List[Node] = []
         
         # 1. 纯文本信息节点
+        screenshot_line_index = None
         if screenshots_urls:
-            infos.append(f"\n📸 预览截图 ({len(screenshots_urls)} 张):") 
+            screenshot_line_index = len(infos)
+            infos.append(f"\n📸 预览截图 ({len(screenshots_urls)} 张):")
+
+        # 2. 图片节点（拼接发送）
+        image_bytes_list = await self._download_screenshots(screenshots_urls)
+        merged_image_bytes = self._merge_images(image_bytes_list)
+        if merged_image_bytes and screenshot_line_index is not None and len(image_bytes_list) != len(screenshots_urls):
+            infos[screenshot_line_index] = (
+                f"\n📸 预览截图 (成功 {len(image_bytes_list)}/{len(screenshots_urls)} 张):"
+            )
 
         info_text = "\n".join(infos)
-        
+
         # 将文本部分分割成节点
         split_texts = self._split_text_by_length(info_text, 4000)
-        
+
         first_node_content = [Plain(text=split_texts[0])]
         forward_nodes.append(Node(uin=sender_id, name="磁力预览信息", content=first_node_content))
-        
-        for i, part_text in enumerate(split_texts[1:], 1):
-             forward_nodes.append(Node(uin=sender_id, name=f"磁力预览信息 ({i+1})", content=[Plain(text=part_text)]))
 
-        # 2. 图片节点
-        async with aiohttp.ClientSession() as session:
-            for url in screenshots_urls:
-                try:
-                    timeout = aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT)
-                    async with session.get(url, timeout=timeout) as img_response:
-                        img_response.raise_for_status()
-                        image_bytes = await img_response.read()
-                    
-                    image_base64 = base64.b64encode(image_bytes).decode()
-                    image_component = Comp.Image(file=f"base64://{image_base64}")
-                    
-                    forward_nodes.append(Node(uin=sender_id, name="预览截图", content=[image_component]))
-                    download_success += 1
-                except (aiohttp.ClientError, asyncio.TimeoutError, Exception) as e:
-                    logger.warning(f"❌ 下载并添加到转发失败 ({url}): {type(e).__name__} - {str(e)}")
-                    continue
+        for i, part_text in enumerate(split_texts[1:], 1):
+            forward_nodes.append(Node(uin=sender_id, name=f"磁力预览信息 ({i+1})", content=[Plain(text=part_text)]))
+
+        if merged_image_bytes:
+            image_component = Comp.Image.fromBytes(merged_image_bytes)
+            forward_nodes.append(Node(uin=sender_id, name="预览截图", content=[image_component]))
         
         # 3. 检查发送结果
-        if download_success == 0 and len(screenshots_urls) > 0:
-            logger.warning("所有图片下载失败，回退到纯文本链接模式。")
+        if not merged_image_bytes and len(screenshots_urls) > 0:
+            logger.warning("所有图片下载/拼接失败，回退到纯文本链接模式。")
             result_message = self._format_text_result(infos, screenshots_urls)
             yield event.plain_result("⚠️ 图片发送失败，已改为发送链接。\n\n" + result_message)
         else:
@@ -203,6 +199,59 @@ class MagnetPreviewer(Star):
         except Exception as e:
             logger.error(f"An unexpected error occurred during fetch: {e}")
             return None
+
+    async def _download_screenshots(self, screenshots_urls: List[str]) -> List[bytes]:
+        """下载截图并返回原始字节列表"""
+        if not screenshots_urls:
+            return []
+
+        timeout = aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            tasks = [self._fetch_image_bytes(session, url) for url in screenshots_urls]
+            results = await asyncio.gather(*tasks)
+        return [result for result in results if result]
+
+    async def _fetch_image_bytes(self, session: aiohttp.ClientSession, url: str) -> bytes | None:
+        try:
+            async with session.get(url) as img_response:
+                img_response.raise_for_status()
+                return await img_response.read()
+        except (aiohttp.ClientError, asyncio.TimeoutError, Exception) as e:
+            logger.warning(f"❌ 下载截图失败 ({url}): {type(e).__name__} - {str(e)}")
+            return None
+
+    def _merge_images(self, image_bytes_list: List[bytes]) -> bytes | None:
+        """将多张图片按垂直方向拼接并输出为 JPEG 字节"""
+        if not image_bytes_list:
+            return None
+
+        images = []
+        for image_bytes in image_bytes_list:
+            try:
+                img = PILImage.open(BytesIO(image_bytes)).convert("RGBA")
+                images.append(img)
+            except Exception as e:
+                logger.warning(f"❌ 处理截图失败: {type(e).__name__} - {str(e)}")
+
+        if not images:
+            return None
+
+        max_width = max(img.width for img in images)
+        total_height = sum(img.height for img in images)
+        canvas = PILImage.new("RGBA", (max_width, total_height), (255, 255, 255, 255))
+
+        y_offset = 0
+        for img in images:
+            x_offset = (max_width - img.width) // 2
+            canvas.paste(img, (x_offset, y_offset), img)
+            y_offset += img.height
+
+        final_image = PILImage.new("RGB", canvas.size, "#ffffff")
+        final_image.paste(canvas, mask=canvas.split()[3])
+
+        buffer = BytesIO()
+        final_image.save(buffer, format="JPEG", quality=85)
+        return buffer.getvalue()
 
     def replace_image_url(self, image_url: str) -> str:
         """替换图片URL域名"""
