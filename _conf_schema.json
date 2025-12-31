@@ -3,7 +3,7 @@
     "description": "是否以直链形式发送截图（而非发送图片）",
     "type": "bool",
     "default": false,
-    "hint": "关闭时，插件将发送拼接后的图片，请注意可能的风险。"
+    "hint": "关闭时，插件将以合并转发发送截图（每张图单独一条）。"
   },
   "max_screenshot_count": {
     "description": "预览截图的最大数量 (0-5)",
